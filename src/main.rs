@@ -11,10 +11,12 @@ use std::{
     net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     str::FromStr,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    select,
-};
+use std::process::exit;
+use std::time::Duration;
+use reqwest::StatusCode;
+use serde_json::{Map, Value};
+use tokio::{io::{AsyncRead, AsyncWrite, AsyncWriteExt}, select, time};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 /// Create a dumb pipe between two machines, using an iroh magicsocket.
@@ -377,6 +379,29 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
         builder = builder.bind_addr_v6(addr);
     }
     let endpoint = builder.bind().await.context("unable to bind magicsock")?;
+
+
+    let e_clone = endpoint.clone();
+
+    tokio::spawn( async move {
+        loop {
+            let connections = e_clone.remote_info_iter().map(|e| format!("{} {}\n", e.node_id, e.conn_type)).collect::<String>();
+
+            let mut map = Map::new();
+            for e in e_clone.remote_info_iter() {
+                map.insert(e.node_id.to_string(), Value::String(e.conn_type.to_string()));
+            }
+            let obj = Value::Object(map);
+            println!("{obj}");
+            sleep(Duration::from_secs(5)).await;
+        }
+
+    });
+
+
+
+
+
     tracing::info!("tcp listening on {:?}", addrs);
     let tcp_listener = match tokio::net::TcpListener::bind(addrs.as_slice()).await {
         Ok(tcp_listener) => tcp_listener,
@@ -476,6 +501,55 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
     }
     tracing::info!("node id is {}", ticket.node_addr().node_id);
     tracing::info!("derp url is {:?}", ticket.node_addr().relay_url);
+
+
+    let ticket_s = ticket.to_string();
+
+    let e_clone = endpoint.clone();
+    tokio::spawn( async move {
+        let client = reqwest::Client::new();
+        let name = String::from("qwerty");
+        loop {
+
+            let mut map = Map::new();
+            for e in e_clone.remote_info_iter() {
+                map.insert(e.node_id.to_string(), Value::String(e.conn_type.to_string()));
+            }
+            let obj = Value::Object(map);
+
+
+            let params = [("name", name.as_str()), ("ticket", &ticket_s), ("connections", &obj.to_string())];
+            println!("omg {}", &obj.to_string());
+
+            let res = client.post("http://localhost:6000/pipe")
+                .form(&params)
+                .send()
+                .await;
+
+            if let Ok(res) = res {
+                match res.status() {
+                    StatusCode::OK => {
+                        println!("Checked in with mothership");
+                        let x = res.text().await;
+                        if let Ok(x) = x {
+                            println!("result is {x}")
+                        }
+
+                    },
+                    _ => {
+                        println!("Failed to post pipe data to mothership");
+                        exit(1)
+                    }
+                }
+            }
+
+            time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+
+
+
 
     // handle a new incoming connection on the magic endpoint
     async fn handle_magic_accept(
