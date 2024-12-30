@@ -140,6 +140,9 @@ pub struct ListenTcpArgs {
 
     #[clap(flatten)]
     pub common: CommonArgs,
+
+    #[clap(long)]
+    pub mothership: Option<String>
 }
 
 #[derive(Parser, Debug)]
@@ -385,14 +388,12 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 
     tokio::spawn( async move {
         loop {
-            let connections = e_clone.remote_info_iter().map(|e| format!("{} {}\n", e.node_id, e.conn_type)).collect::<String>();
-
             let mut map = Map::new();
             for e in e_clone.remote_info_iter() {
                 map.insert(e.node_id.to_string(), Value::String(e.conn_type.to_string()));
             }
             let obj = Value::Object(map);
-            println!("{obj}");
+            eprintln!("{obj}");
             sleep(Duration::from_secs(5)).await;
         }
 
@@ -505,47 +506,55 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
 
     let ticket_s = ticket.to_string();
 
-    let e_clone = endpoint.clone();
-    tokio::spawn( async move {
-        let client = reqwest::Client::new();
-        let name = String::from("qwerty");
-        loop {
+    if let Some(mothership) = args.mothership {
+        eprintln!("Will check in with mothership at {}", &mothership);
+        let e_clone = endpoint.clone();
+        tokio::spawn( async move {
+            let client = reqwest::Client::new();
+            let name = String::from("qwerty");
+            loop {
 
-            let mut map = Map::new();
-            for e in e_clone.remote_info_iter() {
-                map.insert(e.node_id.to_string(), Value::String(e.conn_type.to_string()));
-            }
-            let obj = Value::Object(map);
-
-
-            let params = [("name", name.as_str()), ("ticket", &ticket_s), ("connections", &obj.to_string())];
-            println!("omg {}", &obj.to_string());
-
-            let res = client.post("http://localhost:6000/pipe")
-                .form(&params)
-                .send()
-                .await;
-
-            if let Ok(res) = res {
-                match res.status() {
-                    StatusCode::OK => {
-                        println!("Checked in with mothership");
-                        let x = res.text().await;
-                        if let Ok(x) = x {
-                            println!("result is {x}")
-                        }
-
-                    },
-                    _ => {
-                        println!("Failed to post pipe data to mothership");
-                        exit(1)
-                    }
+                let mut map = Map::new();
+                for e in e_clone.remote_info_iter() {
+                    map.insert(e.node_id.to_string(), Value::String(e.conn_type.to_string()));
                 }
-            }
+                let obj = Value::Object(map);
 
-            time::sleep(Duration::from_secs(5)).await;
-        }
-    });
+
+                let params = [("name", name.as_str()), ("ticket", &ticket_s), ("connections", &obj.to_string())];
+                eprintln!("connection data: {}", &obj.to_string());
+
+                let res = client.post(&mothership)
+                    .form(&params)
+                    .send()
+                    .await;
+
+                if let Ok(res) = res {
+                    match res.status() {
+                        StatusCode::OK => {
+                            eprintln!("Checked in with mothership");
+                            let x = res.text().await;
+                            if let Ok(x) = x {
+                                eprintln!("result is {x}")
+                            }
+
+                        },
+                        _ => {
+                            eprintln!("Failed to post pipe data to mothership");
+                            exit(1)
+                        }
+                    }
+                } else {
+                    eprintln!("Could not connect to mothership")
+                }
+
+                time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    } else {
+         eprintln!("No mothership supplied");
+    }
+
 
 
 
