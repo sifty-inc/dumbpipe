@@ -6,17 +6,17 @@ use iroh::{
     endpoint::{get_remote_node_id, Connecting},
     Endpoint, NodeAddr, SecretKey,
 };
+use reqwest::StatusCode;
+use serde_json::{Map, Value};
+use std::process::exit;
+use std::time::Duration;
 use std::{
     io,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     str::FromStr,
 };
-use std::process::exit;
-use std::time::Duration;
-use reqwest::StatusCode;
-use serde_json::{Map, Value};
-use tokio::{io::{AsyncRead, AsyncWrite, AsyncWriteExt}, select, time};
 use tokio::time::sleep;
+use tokio::{io::{AsyncRead, AsyncWrite, AsyncWriteExt}, select, time};
 use tokio_util::sync::CancellationToken;
 
 /// Create a dumb pipe between two machines, using an iroh magicsocket.
@@ -69,6 +69,9 @@ pub enum Commands {
     /// As far as the magic socket is concerned, this is connecting. But it is
     /// listening on a TCP socket for which you have to specify the interface and port.
     ConnectTcp(ConnectTcpArgs),
+
+    /// Generate a secret to be used with dumbpipe, provide as IROH_SECRET
+    GenSecret(CommonArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -140,9 +143,6 @@ pub struct ListenTcpArgs {
 
     #[clap(flatten)]
     pub common: CommonArgs,
-
-    #[clap(long)]
-    pub mothership: Option<String>
 }
 
 #[derive(Parser, Debug)]
@@ -394,7 +394,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
             }
             let obj = Value::Object(map);
             eprintln!("{obj}");
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(10)).await;
         }
 
     });
@@ -473,6 +473,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
         Err(e) => anyhow::bail!("invalid host string {}: {}", args.host, e),
     };
     let secret_key = get_or_create_secret()?;
+    println!("listening on {}", secret_key);
     let mut builder = Endpoint::builder()
         .alpns(vec![args.common.alpn()?])
         .secret_key(secret_key);
@@ -506,20 +507,32 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
 
     let ticket_s = ticket.to_string();
 
-    if let Some(mothership) = args.mothership {
-        eprintln!("Will check in with mothership at {}", &mothership);
+    if let Ok(mothership) = std::env::var("MOTHERSHIP_URL") {
+        let checkin_internval = match std::env::var("MOTHERSHIP_UPDATE_INTERVAL_SECS") {
+            Ok(val) => u64::from_str_radix(&val, 10).expect("Invalid mothership update interval"),
+            Err(_) => 60
+        };
+        let name = match std::env::var("PROXY_NAME") {
+            Ok(name) => name,
+            Err(_) => {
+                eprintln!("PROXY_NAME is required with mothership");
+                exit(1)
+            }
+        };
+        eprintln!("Will check in with mothership at {}, interval: {}", &mothership, checkin_internval);
         let e_clone = endpoint.clone();
         tokio::spawn( async move {
             let client = reqwest::Client::new();
-            let name = String::from("qwerty");
             loop {
-
                 let mut map = Map::new();
                 for e in e_clone.remote_info_iter() {
-                    map.insert(e.node_id.to_string(), Value::String(e.conn_type.to_string()));
+                    if let Some(last_rec) = e.last_received() {
+                        if last_rec < Duration::from_secs(20) {
+                            map.insert(e.node_id.to_string(), Value::String(e.conn_type.to_string()));
+                        }
+                    }
                 }
                 let obj = Value::Object(map);
-
 
                 let params = [("name", name.as_str()), ("ticket", &ticket_s), ("connections", &obj.to_string())];
                 eprintln!("connection data: {}", &obj.to_string());
@@ -548,7 +561,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
                     eprintln!("Could not connect to mothership")
                 }
 
-                time::sleep(Duration::from_secs(5)).await;
+                time::sleep(Duration::from_secs(checkin_internval)).await;
             }
         });
     } else {
@@ -625,6 +638,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::ListenTcp(args) => listen_tcp(args).await,
         Commands::Connect(args) => connect_stdio(args).await,
         Commands::ConnectTcp(args) => connect_tcp(args).await,
+        Commands::GenSecret(_) => {
+            let key = SecretKey::generate(rand::rngs::OsRng);
+            eprintln!("{}", key);
+            exit(0)
+        }
     };
     match res {
         Ok(()) => std::process::exit(0),
