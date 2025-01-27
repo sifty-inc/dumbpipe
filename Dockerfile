@@ -2,10 +2,14 @@ FROM rust:1.83-bookworm AS dumbpipe_builder
 
 WORKDIR /app
 
-ADD ./src /app/src
+RUN mkdir /app/src/; echo "fn main() {}" > /app/src/main.rs
 ADD ./Cargo.toml /app/Cargo.toml
 ADD ./Cargo.lock /app/Cargo.lock
+# can only build dependencies if i build project
+RUN cargo build --release
+RUN rm /app/src/main.rs
 
+ADD ./src /app/src
 RUN cargo build --release
 
 
@@ -17,8 +21,9 @@ FROM debian:bookworm-slim
 COPY --from=proxy /socks5 /
 COPY --from=dumbpipe_builder /app/target/release/dumbpipe /
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 ENTRYPOINT ["/bin/bash"]

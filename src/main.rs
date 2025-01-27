@@ -543,23 +543,26 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
                     .send()
                     .await;
 
-                if let Ok(res) = res {
-                    match res.status() {
-                        StatusCode::OK => {
-                            eprintln!("Checked in with mothership");
-                            let x = res.text().await;
-                            if let Ok(x) = x {
-                                eprintln!("result is {x}")
-                            }
+                match res {
+                    Ok(res) => {
+                        match res.status() {
+                            StatusCode::OK => {
+                                eprintln!("Checked in with mothership");
+                                let x = res.text().await;
+                                if let Ok(x) = x {
+                                    eprintln!("result is {x}")
+                                }
 
-                        },
-                        _ => {
-                            eprintln!("Failed to post pipe data to mothership");
-                            exit(1)
+                            },
+                            _ => {
+                                eprintln!("Failed to post pipe data to mothership");
+                                exit(1)
+                            }
                         }
+                    },
+                    Err(e) => {
+                        eprintln!("Could not connect to mothership {:?}", e)
                     }
-                } else {
-                    eprintln!("Could not connect to mothership")
                 }
 
                 time::sleep(Duration::from_secs(checkin_internval)).await;
