@@ -519,6 +519,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
                 exit(1)
             }
         };
+        println!("Proxy name: {name}");
         eprintln!("Will check in with mothership at {}, interval: {}", &mothership, checkin_internval);
         let e_clone = endpoint.clone();
         tokio::spawn( async move {
