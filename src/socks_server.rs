@@ -8,15 +8,15 @@ use tokio::task;
 use tokio_stream::StreamExt;
 use tracing::{info, warn};
 
-const LISTEN_ADDR: &str = "127.0.0.1:1080";
+pub const SOCKS_LISTEN_ADDR: &str = "127.0.0.1:1080";
 
 pub(crate) async fn spawn_socks_server() -> Result<()> {
-    let listener = <Socks5Server>::bind(LISTEN_ADDR).await?;
+    let listener = <Socks5Server>::bind(SOCKS_LISTEN_ADDR).await?;
     let listener = listener.with_config(Config::default());
 
     let mut incoming = listener.incoming();
 
-    info!("Listen for socks connections @ {}", LISTEN_ADDR);
+    info!("Listen for socks connections @ {}", SOCKS_LISTEN_ADDR);
 
     // Standard TCP loop
     while let Some(socket_res) = incoming.next().await {

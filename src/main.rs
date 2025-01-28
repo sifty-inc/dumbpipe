@@ -13,15 +13,15 @@ use reqwest::StatusCode;
 use serde_json::{Map, Value};
 use std::process::exit;
 use std::time::Duration;
-use std::{
-    io,
-    net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
-    str::FromStr,
-};
+use std::{fs, io, net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs}, str::FromStr};
+use std::io::Read;
 use tokio::time::sleep;
 use tokio::{io::{AsyncRead, AsyncWrite, AsyncWriteExt}, select, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use serde::Deserialize;
+use toml::de::Error;
+use crate::socks_server::SOCKS_LISTEN_ADDR;
 
 /// Create a dumb pipe between two machines, using an iroh magicsocket.
 ///
@@ -59,6 +59,9 @@ pub enum Commands {
     /// As far as the magic socket is concerned, this is listening. But it is
     /// connecting to a TCP socket for which you have to specify the host and port.
     ListenTcp(ListenTcpArgs),
+
+    /// The same as listen tcp, but automatically connects to 127.0.0.1:1080
+    SocksServerForward(SocksServerForwardArgs),
 
     /// Connect to a magicsocket, open a bidi stream, and forward stdin/stdout.
     ///
@@ -145,6 +148,12 @@ pub struct ListenTcpArgs {
     #[clap(long)]
     pub host: String,
 
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct SocksServerForwardArgs {
     #[clap(flatten)]
     pub common: CommonArgs,
 }
@@ -472,7 +481,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 
 /// Listen on a magicsocket and forward incoming connections to a tcp socket.
 async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
-
+    let file_cfg = try_load_config_from_file();
     tokio::spawn(async {
         socks_server::spawn_socks_server().await.expect("Failed to start SOCKS5 server");
     });
@@ -481,8 +490,19 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
         Err(e) => anyhow::bail!("invalid host string {}: {}", args.host, e),
     };
-    let secret_key = get_or_create_secret()?;
-    info!("listening on {}", secret_key);
+    let secret_key: SecretKey = match &file_cfg {
+        Some(cfg) => {
+            if let Some(sec) = cfg.iroh_secret.as_ref() {
+                info!("Loaded secret key from file");
+                SecretKey::from_str(sec.as_str()).context("invalid secret")?
+            } else {
+                get_or_create_secret()?
+            }
+        },
+        _ => get_or_create_secret()?
+    };
+    info!("Listening on {}", secret_key);
+
     let mut builder = Endpoint::builder()
         .alpns(vec![args.common.alpn()?])
         .secret_key(secret_key);
@@ -516,14 +536,39 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
 
     let ticket_s = ticket.to_string();
 
-    if let Ok(mothership) = std::env::var("MOTHERSHIP_URL") {
+    let mothership: Option<String> = match std::env::var("MOTHERSHIP_URL") {
+        Ok(url) => Some(url),
+        Err(_) =>  {
+           match &file_cfg {
+               None => None,
+               Some(ref c) => {
+                   c.mothership_url.clone()
+               }
+           }
+        }
+    };
+
+    let proxy_name: Option<String> = match std::env::var("PROXY_NAME") {
+        Ok(url) => Some(url),
+        Err(_) =>  {
+            match &file_cfg {
+                None => None,
+                Some(ref c) => {
+                    c.proxy_name.clone()
+                }
+            }
+        }
+    };
+
+
+    if let Some(mothership) = mothership {
         let checkin_internval = match std::env::var("MOTHERSHIP_UPDATE_INTERVAL_SECS") {
             Ok(val) => u64::from_str_radix(&val, 10).expect("Invalid mothership update interval"),
             Err(_) => 60
         };
-        let name = match std::env::var("PROXY_NAME") {
-            Ok(name) => name,
-            Err(_) => {
+        let name = match proxy_name {
+            Some(name) => name,
+            None => {
                 error!("PROXY_NAME is required with mothership");
                 exit(1)
             }
@@ -642,28 +687,74 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct SocksForwardConfig {
+    mothership_url: Option<String>,
+    proxy_name: Option<String>,
+    iroh_secret: Option<String>
+}
+
+fn read_file_if_exists(path: &str) -> Option<String> {
+    if let Ok(mut file) = fs::File::open(path) {
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_ok() {
+            Some(contents)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn try_load_config_from_file() -> Option<SocksForwardConfig> {
+    let filedata = read_file_if_exists("./config.toml");
+    if let Some(filedata) = filedata {
+        let cfg: Result<SocksForwardConfig, Error> = toml::from_str(&filedata);
+        cfg.ok()
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("dumbpipe=info,dumbpipe::socks_server=info")
         .init();
-    let args = Args::parse();
-    let res = match args.command {
-        Commands::Listen(args) => listen_stdio(args).await,
-        Commands::ListenTcp(args) => listen_tcp(args).await,
-        Commands::Connect(args) => connect_stdio(args).await,
-        Commands::ConnectTcp(args) => connect_tcp(args).await,
-        Commands::GenSecret(_) => {
-            let key = SecretKey::generate(rand::rngs::OsRng);
-            println!("{}", key);
-            exit(0)
+    let args = Args::try_parse();
+    if let Ok(args) = args {
+        let res = match args.command {
+            Commands::Listen(args) => listen_stdio(args).await,
+            Commands::ListenTcp(args) => listen_tcp(args).await,
+            Commands::SocksServerForward(args) => {
+                let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: args.common };
+                listen_tcp(listen_args).await
+            },
+            Commands::Connect(args) => connect_stdio(args).await,
+            Commands::ConnectTcp(args) => connect_tcp(args).await,
+            Commands::GenSecret(_) => {
+                let key = SecretKey::generate(rand::rngs::OsRng);
+                println!("{}", key);
+                exit(0)
+            }
+        };
+        match res {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1)
+            }
         }
-    };
-    match res {
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1)
-        }
+    } else {
+        info!("No command supplied, operating in socks server forward mode");
+        // no command was specified in the arguments, run the server socks command
+        let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: CommonArgs {
+            magic_ipv4_addr: None,
+            magic_ipv6_addr: None,
+            custom_alpn: None,
+            verbose: 0,
+        } };
+        listen_tcp(listen_args).await
     }
 }

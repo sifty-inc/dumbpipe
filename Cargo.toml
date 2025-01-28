@@ -29,6 +29,8 @@ tokio-util = "0.7.10"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tokio-stream = "0.1.17"
+serde = { version = "1.0.216", features = ["derive"] }
+toml = "0.8.19"
 
 [dev-dependencies]
 duct = "0.13.6"
