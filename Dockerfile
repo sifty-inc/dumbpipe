@@ -13,12 +13,7 @@ ADD ./src /app/src
 RUN cargo build --release
 
 
-FROM serjs/go-socks5-proxy AS  proxy
-
-
 FROM debian:bookworm-slim
-
-COPY --from=proxy /socks5 /
 COPY --from=dumbpipe_builder /app/target/release/dumbpipe /
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

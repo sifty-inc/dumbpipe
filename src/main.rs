@@ -1,4 +1,7 @@
 //! Command line arguments.
+
+mod socks_server;
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dumbpipe::NodeTicket;
@@ -18,6 +21,7 @@ use std::{
 use tokio::time::sleep;
 use tokio::{io::{AsyncRead, AsyncWrite, AsyncWriteExt}, select, time};
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 /// Create a dumb pipe between two machines, using an iroh magicsocket.
 ///
@@ -225,7 +229,7 @@ fn get_or_create_secret() -> anyhow::Result<SecretKey> {
         Ok(secret) => SecretKey::from_str(&secret).context("invalid secret"),
         Err(_) => {
             let key = SecretKey::generate(rand::rngs::OsRng);
-            eprintln!("using secret key {}", key);
+            info!("using secret key {}", key);
             Ok(key)
         }
     }
@@ -293,9 +297,9 @@ async fn listen_stdio(args: ListenArgs) -> anyhow::Result<()> {
     // print the ticket on stderr so it doesn't interfere with the data itself
     //
     // note that the tests rely on the ticket being the last thing printed
-    eprintln!("Listening. To connect, use:\ndumbpipe connect {}", ticket);
+    info!("Listening. To connect, use:\ndumbpipe connect {}", ticket);
     if args.common.verbose > 0 {
-        eprintln!("or:\ndumbpipe connect {}", short);
+        info!("or:\ndumbpipe connect {}", short);
     }
 
     loop {
@@ -311,7 +315,7 @@ async fn listen_stdio(args: ListenArgs) -> anyhow::Result<()> {
             }
         };
         let remote_node_id = get_remote_node_id(&connection)?;
-        tracing::info!("got connection from {}", remote_node_id);
+        tracing::debug!("got connection from {}", remote_node_id);
         let (s, mut r) = match connection.accept_bi().await {
             Ok(x) => x,
             Err(cause) => {
@@ -320,7 +324,7 @@ async fn listen_stdio(args: ListenArgs) -> anyhow::Result<()> {
                 continue;
             }
         };
-        tracing::info!("accepted bidi stream from {}", remote_node_id);
+        tracing::debug!("accepted bidi stream from {}", remote_node_id);
         if !args.common.is_custom_alpn() {
             // read the handshake and verify it
             let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
@@ -468,12 +472,17 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 
 /// Listen on a magicsocket and forward incoming connections to a tcp socket.
 async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
+
+    tokio::spawn(async {
+        socks_server::spawn_socks_server().await.expect("Failed to start SOCKS5 server");
+    });
+
     let addrs = match args.host.to_socket_addrs() {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
         Err(e) => anyhow::bail!("invalid host string {}: {}", args.host, e),
     };
     let secret_key = get_or_create_secret()?;
-    println!("listening on {}", secret_key);
+    info!("listening on {}", secret_key);
     let mut builder = Endpoint::builder()
         .alpns(vec![args.common.alpn()?])
         .secret_key(secret_key);
@@ -495,14 +504,14 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
     // print the ticket on stderr so it doesn't interfere with the data itself
     //
     // note that the tests rely on the ticket being the last thing printed
-    eprintln!("Forwarding incoming requests to '{}'.", args.host);
-    eprintln!("To connect, use e.g.:");
-    eprintln!("dumbpipe connect-tcp {ticket}");
+    info!("Forwarding incoming requests to '{}'.", args.host);
+    info!("To connect, use e.g.:");
+    info!("dumbpipe connect-tcp {ticket}");
     if args.common.verbose > 0 {
-        eprintln!("or:\ndumbpipe connect-tcp {}", short);
+        info!("or:\ndumbpipe connect-tcp {}", short);
     }
-    tracing::info!("node id is {}", ticket.node_addr().node_id);
-    tracing::info!("derp url is {:?}", ticket.node_addr().relay_url);
+    info!("node id is {}", ticket.node_addr().node_id);
+    info!("derp url is {:?}", ticket.node_addr().relay_url);
 
 
     let ticket_s = ticket.to_string();
@@ -515,12 +524,12 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
         let name = match std::env::var("PROXY_NAME") {
             Ok(name) => name,
             Err(_) => {
-                eprintln!("PROXY_NAME is required with mothership");
+                error!("PROXY_NAME is required with mothership");
                 exit(1)
             }
         };
-        println!("Proxy name: {name}");
-        eprintln!("Will check in with mothership at {}, interval: {}", &mothership, checkin_internval);
+        info!("Proxy name: {name}");
+        info!("Will check in with mothership at {}, interval: {}", &mothership, checkin_internval);
         let e_clone = endpoint.clone();
         tokio::spawn( async move {
             let client = reqwest::Client::new();
@@ -536,7 +545,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
                 let obj = Value::Object(map);
 
                 let params = [("name", name.as_str()), ("ticket", &ticket_s), ("connections", &obj.to_string())];
-                eprintln!("connection data: {}", &obj.to_string());
+                info!("connection data: {}", &obj.to_string());
 
                 let res = client.post(&mothership)
                     .form(&params)
@@ -547,21 +556,21 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
                     Ok(res) => {
                         match res.status() {
                             StatusCode::OK => {
-                                eprintln!("Checked in with mothership");
+                                info!("Checked in with mothership");
                                 let x = res.text().await;
                                 if let Ok(x) = x {
-                                    eprintln!("result is {x}")
+                                    info!("result is {x}")
                                 }
 
                             },
                             _ => {
-                                eprintln!("Failed to post pipe data to mothership");
+                                error!("Failed to post pipe data to mothership");
                                 exit(1)
                             }
                         }
                     },
                     Err(e) => {
-                        eprintln!("Could not connect to mothership {:?}", e)
+                        warn!("Could not connect to mothership {:?}", e)
                     }
                 }
 
@@ -569,7 +578,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
             }
         });
     } else {
-         eprintln!("No mothership supplied");
+         warn!("No mothership supplied");
     }
 
 
@@ -590,7 +599,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
             .accept_bi()
             .await
             .context("error accepting stream")?;
-        tracing::info!("accepted bidi stream from {}", remote_node_id);
+        tracing::debug!("accepted bidi stream from {}", remote_node_id);
         if handshake {
             // read the handshake and verify it
             let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
@@ -609,7 +618,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
         let incoming = select! {
             incoming = endpoint.accept() => incoming,
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("got ctrl-c, exiting");
+                info!("got ctrl-c, exiting");
                 break;
             }
         };
@@ -635,7 +644,9 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter("dumbpipe=info,dumbpipe::socks_server=info")
+        .init();
     let args = Args::parse();
     let res = match args.command {
         Commands::Listen(args) => listen_stdio(args).await,
@@ -644,7 +655,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::ConnectTcp(args) => connect_tcp(args).await,
         Commands::GenSecret(_) => {
             let key = SecretKey::generate(rand::rngs::OsRng);
-            eprintln!("{}", key);
+            println!("{}", key);
             exit(0)
         }
     };

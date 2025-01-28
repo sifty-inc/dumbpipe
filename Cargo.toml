@@ -16,6 +16,7 @@ rust-version = "1.81"
 [dependencies]
 anyhow = "1.0.75"
 clap = { version = "4.4.10", features = ["derive"] }
+fast-socks5 = "0.10.0"
 hex = "0.4.3"
 iroh = { version = "0.30", default-features = false }
 iroh-base = { version = "0.30", features = ["ticket"] }
@@ -27,6 +28,7 @@ tokio = { version = "1.34.0", features = ["full"] }
 tokio-util = "0.7.10"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tokio-stream = "0.1.17"
 
 [dev-dependencies]
 duct = "0.13.6"
