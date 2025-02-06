@@ -608,9 +608,13 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
                                 }
 
                             },
-                            _ => {
-                                error!("Failed to post pipe data to mothership");
+                            StatusCode::GONE => {
+                                error!("Mothership sent status 410: Gone, shutting down");
                                 exit(1)
+                            },
+                            status_code => {
+                                let res = res.text().await.unwrap_or(String::from("unknown"));
+                                error!("Check in failed, will retry. Got status code {status_code}: {res}");
                             }
                         }
                     },
