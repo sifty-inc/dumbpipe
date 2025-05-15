@@ -491,7 +491,6 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 }
 
 fn setup_relay_if_specified(mut builder: Builder) -> Builder {
-    println!("relay check");
     match std::env::var("IROH_RELAY_URL") {
         Ok(url) => {
             match Url::parse(&url) {
@@ -499,7 +498,6 @@ fn setup_relay_if_specified(mut builder: Builder) -> Builder {
                     let relay_url: RelayUrl = url.into();
                     let relay_map: RelayMap = relay_url.into();
                     builder = builder.relay_mode(RelayMode::Custom(relay_map));
-                    println!("relay do!")
                 }
                 _ => {
                     tracing::error!("invalid IROH_RELAY_URL: {}", url);
