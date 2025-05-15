@@ -5,18 +5,16 @@ mod socks_server;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dumbpipe::NodeTicket;
-use iroh::{
-    endpoint::{get_remote_node_id, Connecting},
-    Endpoint, NodeAddr, SecretKey,
+use iroh::{endpoint::Connecting, Endpoint, NodeAddr, SecretKey};
+use std::{
+    io,
+    net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
+    str::FromStr,
 };
-use reqwest::StatusCode;
-use serde_json::{Map, Value};
-use std::process::exit;
-use std::time::Duration;
-use std::{fs, io, net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs}, str::FromStr};
-use std::io::Read;
-use tokio::time::sleep;
-use tokio::{io::{AsyncRead, AsyncWrite, AsyncWriteExt}, select, time};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    select,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use serde::Deserialize;
@@ -323,8 +321,8 @@ async fn listen_stdio(args: ListenArgs) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let remote_node_id = get_remote_node_id(&connection)?;
-        tracing::debug!("got connection from {}", remote_node_id);
+        let remote_node_id = &connection.remote_node_id()?;
+        tracing::info!("got connection from {}", remote_node_id);
         let (s, mut r) = match connection.accept_bi().await {
             Ok(x) => x,
             Err(cause) => {
@@ -642,7 +640,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
         handshake: bool,
     ) -> anyhow::Result<()> {
         let connection = connecting.await.context("error accepting connection")?;
-        let remote_node_id = get_remote_node_id(&connection)?;
+        let remote_node_id = &connection.remote_node_id()?;
         tracing::info!("got connection from {}", remote_node_id);
         let (s, mut r) = connection
             .accept_bi()

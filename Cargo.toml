@@ -1,6 +1,6 @@
 [package]
 name = "dumbpipe"
-version = "0.22.0"
+version = "0.27.0"
 edition = "2021"
 authors = ["Rüdiger Klaehn <rklaehn@protonmail.com>", "n0 team"]
 keywords = ["netcat", "cli", "network", "p2p", "holepunching"]
@@ -18,9 +18,9 @@ anyhow = "1.0.75"
 clap = { version = "4.4.10", features = ["derive"] }
 fast-socks5 = "0.10.0"
 hex = "0.4.3"
-iroh = { version = "0.30", default-features = false }
-iroh-base = { version = "0.30", features = ["ticket"] }
-quinn = { version = "0.12", package = "iroh-quinn" }
+iroh = { version = "0.35", default-features = false }
+iroh-base = { version = "0.35", features = ["ticket"] }
+quinn = { version = "0.13", package = "iroh-quinn" }
 rand = "0.8.5"
 reqwest = "0.12.9"
 serde_json = "1.0.133"
