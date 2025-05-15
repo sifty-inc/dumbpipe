@@ -874,13 +874,14 @@ checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
 
 [[package]]
 name = "fast-socks5"
-version = "0.10.0"
+version = "1.0.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d09fe4a491909a716088083eeb5bcc25427330fdbcd4ecd3dfa5469b3da795df"
+checksum = "7b243b80e73f3596fc64089c4c82ad7196d502c513127c5c8987337d51a5399d"
 dependencies = [
  "anyhow",
  "async-trait",
  "log",
+ "socket2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",

@@ -16,7 +16,7 @@ rust-version = "1.81"
 [dependencies]
 anyhow = "1.0.75"
 clap = { version = "4.4.10", features = ["derive"] }
-fast-socks5 = "0.10.0"
+fast-socks5 = "1.0.0-rc.0"
 hex = "0.4.3"
 iroh = { version = "0.35", default-features = false }
 iroh-base = { version = "0.35", features = ["ticket"] }
