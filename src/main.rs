@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use tokio::fs::File;
 use tokio::time::sleep;
 use toml::de::Error;
 use crate::socks_server::SOCKS_LISTEN_ADDR;
@@ -147,12 +148,18 @@ pub struct ListenTcpArgs {
 
     #[clap(flatten)]
     pub common: CommonArgs,
+
+    #[clap(long)]
+    pub ticket_out_path: Option<String>,
 }
 
 #[derive(Parser, Debug)]
 pub struct SocksServerForwardArgs {
     #[clap(flatten)]
     pub common: CommonArgs,
+
+    #[clap(long)]
+    pub ticket_out_path: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -477,11 +484,14 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 }
 
 /// Listen on a magicsocket and forward incoming connections to a tcp socket.
-async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
+async fn listen_tcp(args: ListenTcpArgs, do_socks: bool) -> anyhow::Result<()> {
     let file_cfg = try_load_config_from_file();
-    tokio::spawn(async {
-        socks_server::spawn_socks_server().await.expect("Failed to start SOCKS5 server");
-    });
+
+    if do_socks {
+        tokio::spawn(async {
+            socks_server::spawn_socks_server().await.expect("Failed to start SOCKS5 server");
+        });
+    }
 
     let addrs = match args.host.to_socket_addrs() {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
@@ -532,6 +542,11 @@ async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
 
 
     let ticket_s = ticket.to_string();
+
+    if let Some(ticket_out) = &args.ticket_out_path {
+        let mut file = File::create(ticket_out).await?;
+        file.write_all(ticket_s.as_bytes()).await?;
+    }
 
     let mothership: Option<String> = match std::env::var("MOTHERSHIP_URL") {
         Ok(url) => Some(url),
@@ -724,13 +739,14 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter("dumbpipe=info,dumbpipe::socks_server=info")
         .init();
     let args = Args::try_parse();
+
     if let Ok(args) = args {
         let res = match args.command {
             Commands::Listen(args) => listen_stdio(args).await,
-            Commands::ListenTcp(args) => listen_tcp(args).await,
+            Commands::ListenTcp(args) => listen_tcp(args, false).await,
             Commands::SocksServerForward(args) => {
-                let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: args.common };
-                listen_tcp(listen_args).await
+                let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: args.common, ticket_out_path: args.ticket_out_path  };
+                listen_tcp(listen_args, true).await
             },
             Commands::Connect(args) => connect_stdio(args).await,
             Commands::ConnectTcp(args) => connect_tcp(args).await,
@@ -750,12 +766,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         info!("No command supplied, operating in socks server forward mode");
         // no command was specified in the arguments, run the server socks command
-        let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: CommonArgs {
+        let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), ticket_out_path: None, common: CommonArgs {
             magic_ipv4_addr: None,
             magic_ipv6_addr: None,
             custom_alpn: None,
             verbose: 0,
         } };
-        listen_tcp(listen_args).await
+        listen_tcp(listen_args, true).await
     }
 }
