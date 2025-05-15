@@ -5,12 +5,14 @@ mod socks_server;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dumbpipe::NodeTicket;
-use iroh::{endpoint::Connecting, Endpoint, NodeAddr, SecretKey};
+use iroh::{endpoint::Connecting, Endpoint, NodeAddr, RelayMap, RelayMode, SecretKey};
 use std::{fs, io, net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs}, str::FromStr};
 use std::io::Read;
 use std::process::exit;
 use std::time::Duration;
-use reqwest::StatusCode;
+use iroh::endpoint::Builder;
+use iroh_base::RelayUrl;
+use reqwest::{StatusCode, Url};
 use tokio::{io::{AsyncRead, AsyncWrite, AsyncWriteExt}, select, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -392,14 +394,19 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
         .context(format!("invalid host string {}", args.addr))?;
     let secret_key = get_or_create_secret()?;
     let mut builder = Endpoint::builder().alpns(vec![]).secret_key(secret_key);
+
+    builder = setup_relay_if_specified(builder);
+
     if let Some(addr) = args.common.magic_ipv4_addr {
         builder = builder.bind_addr_v4(addr);
     }
     if let Some(addr) = args.common.magic_ipv6_addr {
         builder = builder.bind_addr_v6(addr);
     }
-    let endpoint = builder.bind().await.context("unable to bind magicsock")?;
 
+
+    let endpoint = builder.bind().await.context("unable to bind magicsock")?;
+    tracing::info!("node id {}",  endpoint.node_id());
 
     let e_clone = endpoint.clone();
 
@@ -483,6 +490,28 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn setup_relay_if_specified(mut builder: Builder) -> Builder {
+    println!("relay check");
+    match std::env::var("IROH_RELAY_URL") {
+        Ok(url) => {
+            match Url::parse(&url) {
+                Ok(url) => {
+                    let relay_url: RelayUrl = url.into();
+                    let relay_map: RelayMap = relay_url.into();
+                    builder = builder.relay_mode(RelayMode::Custom(relay_map));
+                    println!("relay do!")
+                }
+                _ => {
+                    tracing::error!("invalid IROH_RELAY_URL: {}", url);
+                }
+            };
+        },
+        Err(_) => {}
+    };
+    builder
+
+}
+
 /// Listen on a magicsocket and forward incoming connections to a tcp socket.
 async fn listen_tcp(args: ListenTcpArgs, do_socks: bool) -> anyhow::Result<()> {
     let file_cfg = try_load_config_from_file();
@@ -519,6 +548,8 @@ async fn listen_tcp(args: ListenTcpArgs, do_socks: bool) -> anyhow::Result<()> {
     if let Some(addr) = args.common.magic_ipv6_addr {
         builder = builder.bind_addr_v6(addr);
     }
+    builder = setup_relay_if_specified(builder);
+
     let endpoint = builder.bind().await?;
     // wait for the endpoint to figure out its address before making a ticket
     endpoint.home_relay().initialized().await?;
