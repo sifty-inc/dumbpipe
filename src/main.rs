@@ -491,7 +491,6 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 }
 
 fn setup_relay_if_specified(mut builder: Builder) -> Builder {
-    println!("HELLO");
     match std::env::var("IROH_RELAY_URL") {
         Ok(url) => {
             match Url::parse(&url) {
@@ -803,7 +802,7 @@ async fn main() -> anyhow::Result<()> {
             custom_alpn: None,
             verbose: 0,
         } };
-        listen_tcp(listen_args, true)
+        listen_tcp(listen_args, true).await.expect("listen failed")
     };
     info!("Dumbpipe exiting");
     Ok(())
