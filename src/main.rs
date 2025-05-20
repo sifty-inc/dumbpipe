@@ -491,6 +491,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 }
 
 fn setup_relay_if_specified(mut builder: Builder) -> Builder {
+    println!("HELLO");
     match std::env::var("IROH_RELAY_URL") {
         Ok(url) => {
             match Url::parse(&url) {
@@ -768,6 +769,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter("dumbpipe=info,dumbpipe::socks_server=info")
         .init();
     let args = Args::try_parse();
+    info!("Dumbpipe starting, version {}", env!("VERGEN_RUSTC_COMMIT_HASH"));
 
     if let Ok(args) = args {
         let res = match args.command {
@@ -801,6 +803,8 @@ async fn main() -> anyhow::Result<()> {
             custom_alpn: None,
             verbose: 0,
         } };
-        listen_tcp(listen_args, true).await
-    }
+        listen_tcp(listen_args, true)
+    };
+    info!("Dumbpipe exiting");
+    Ok(())
 }
