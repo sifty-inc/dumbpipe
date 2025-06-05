@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 
 pub const SOCKS_LISTEN_ADDR: &str = "127.0.0.1:1080";
 
-pub(crate) async fn spawn_socks_server() -> Result<()> {
+pub async fn spawn_socks_server() -> Result<()> {
     let listener = TcpListener::bind(SOCKS_LISTEN_ADDR).await?;
 
     info!("Listen for socks connections @ {}", SOCKS_LISTEN_ADDR);
