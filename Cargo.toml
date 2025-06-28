@@ -16,10 +16,16 @@ rust-version = "1.81"
 [lib]
 # Optionally set a custom path or name
 path = "src/lib.rs"
+crate-type = ["lib", "staticlib"]
 
 [[bin]]
 name = "dumbpipe"
 path = "src/main.rs"
+
+[[bin]]
+# This can be whatever name makes sense for your project, but the rest of this tutorial assumes uniffi-bindgen.
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
 
 [dependencies]
 anyhow = "1.0.75"
@@ -40,10 +46,14 @@ tokio-stream = "0.1.17"
 serde = { version = "1.0.216", features = ["derive"] }
 toml = "0.8.19"
 vergen = "9.0.6"
+cargo-xcode = "1.11.0"
+uniffi = { version = "0.29.2", features = ["cli"] }
 
 [dev-dependencies]
 duct = "0.13.6"
 nix = { version = "0.29", features = ["signal", "process"] }
+uniffi_bindgen = "0.29.2"
+uniffi_build = "0.29.2"
 
 [build-dependencies]
 vergen = { version = "9.0.0", features = ["build", "cargo", "rustc", "si"] }

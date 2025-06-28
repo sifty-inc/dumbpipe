@@ -1,11 +1,14 @@
 use fast_socks5::server::{run_tcp_proxy, DnsResolveHelper, Socks5ServerProtocol};
 use fast_socks5::{ReplyError, Result, Socks5Command, SocksError};
 use std::future::Future;
+use std::net::SocketAddr::{V4, V6};
+use fast_socks5::util::target_addr::TargetAddr;
+use fast_socks5::util::target_addr::TargetAddr::Ip;
 use tokio::net::TcpListener;
 use tokio::task;
 use tracing::{error, info, warn};
 
-pub const SOCKS_LISTEN_ADDR: &str = "127.0.0.1:1080";
+pub const SOCKS_LISTEN_ADDR: &str = "127.0.0.1:52923";
 
 pub async fn spawn_socks_server() -> Result<()> {
     let listener = TcpListener::bind(SOCKS_LISTEN_ADDR).await?;
@@ -37,6 +40,28 @@ async fn serve_socks5(socket: tokio::net::TcpStream) -> Result<(), SocksError> {
 
     match cmd {
         Socks5Command::TCPConnect => {
+            let mut deny_connection = false;
+            if let Ip(ip) = target_addr {
+                if let V4(s_ipv4) = ip {
+                    let ipv4 = s_ipv4.ip();
+                    if ipv4.is_loopback() || ipv4.is_private() || ipv4.is_broadcast() || ipv4.is_link_local() {
+                        deny_connection = true;
+                    }
+                } else if let V6(s_ipv6) = ip {
+                    let ipv6 = s_ipv6.ip();
+                    if ipv6.is_loopback() || ipv6.is_multicast() || ipv6.is_unique_local() || ipv6.is_unicast_link_local() {
+                        deny_connection = true;
+                    }
+                }
+            } else {
+                deny_connection = true;
+            }
+
+            if deny_connection {
+                warn!("Denied connection to {:?}", target_addr);
+                return Err(ReplyError::ConnectionNotAllowed.into());
+            }
+
             run_tcp_proxy(proto, &target_addr, TIMEOUT, false).await?;
         }
         _ => {

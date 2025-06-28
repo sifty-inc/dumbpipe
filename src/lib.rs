@@ -23,16 +23,21 @@ use std::net::{SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::process::exit;
 use std::str::FromStr;
 use std::time::Duration;
-use std::{fs, io};
+use std::{fs, io, thread};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::{select, time};
+use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 use toml::de::Error;
 use tracing::log::warn;
 use tracing::{error, info};
+use crate::socks_server::SOCKS_LISTEN_ADDR;
 
 mod socks_server;
+
+uniffi::setup_scaffolding!();
+
 
 #[derive(Parser, Debug)]
 pub struct ListenTcpArgs {
@@ -77,6 +82,11 @@ pub struct CommonArgs {
     #[clap(long)]
     pub custom_alpn: Option<String>,
 
+    /// How many seconds to wait before shutting down.  To be used in conjunction with auto
+    /// restart scripts
+    #[clap(long)]
+    pub auto_shutdown: Option<u32>,
+
     /// The verbosity level. Repeat to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -114,7 +124,7 @@ fn parse_alpn(alpn: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 #[derive(Deserialize)]
-struct SocksForwardConfig {
+pub struct SocksForwardConfig {
     mothership_url: Option<String>,
     proxy_name: Option<String>,
     iroh_secret: Option<String>
@@ -269,8 +279,13 @@ fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
 }
 
 /// Listen on a magicsocket and forward incoming connections to a tcp socket.
-pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool) -> anyhow::Result<()> {
-    let file_cfg = try_load_config_from_file();
+pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Option<SocksForwardConfig>) -> anyhow::Result<()> {
+
+    let file_cfg = if let Some(cfg) = input_config {
+        Some(cfg)
+    } else {
+        try_load_config_from_file()
+    };
 
     if do_socks {
         tokio::spawn(async {
@@ -487,4 +502,37 @@ pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool) -> anyhow::Result<(
         });
     }
     Ok(())
+}
+
+#[uniffi::export]
+pub fn mobile_start_hook(mothership_url: String, proxy_name: String, iroh_secret: String) {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter("dumbpipe=info,dumbpipe::socks_server=info")
+        .init();
+    info!("🦀 Dumbpipe starting, version {}", env!("VERGEN_RUSTC_COMMIT_HASH"));
+    let cargs = CommonArgs {
+        magic_ipv4_addr: None,
+        magic_ipv6_addr: None,
+        custom_alpn: None,
+        verbose: 0,
+        auto_shutdown: None
+    };
+    let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: cargs, ticket_out_path: None  };
+    let rt = Runtime::new().expect("Unable to start a tokio runtime");
+    thread::spawn(move || {
+        info!("Started bg thread");
+        let _ = rt.block_on(async move {
+            info!("starting listen tcp");
+            let cfg = SocksForwardConfig {
+                mothership_url: Some(mothership_url),
+                proxy_name: Some(proxy_name),
+                iroh_secret: Some(iroh_secret)
+            };
+            listen_tcp(listen_args, true, Some(cfg)).await
+        });
+    });
+
+    info!("Spawned tokio task");
+
 }

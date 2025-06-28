@@ -325,6 +325,16 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 
 
 
+async fn check_auto_shutdown(options: &CommonArgs) {
+    if let Some(secs) = options.auto_shutdown {
+        info!("Will automatically shutdown in {} seconds", secs);
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(secs as u64)).await;
+            info!("Auto shutdown happening NOW");
+            exit(0);
+        });
+    }
+}
 
 
 #[tokio::main]
@@ -338,10 +348,11 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(args) = args {
         let res = match args.command {
             Commands::Listen(args) => listen_stdio(args).await,
-            Commands::ListenTcp(args) => listen_tcp(args, false).await,
+            Commands::ListenTcp(args) => listen_tcp(args, false, None).await,
             Commands::SocksServerForward(args) => {
+                check_auto_shutdown(&args.common).await;
                 let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: args.common, ticket_out_path: args.ticket_out_path  };
-                listen_tcp(listen_args, true).await
+                listen_tcp(listen_args, true, None).await
             },
             Commands::Connect(args) => connect_stdio(args).await,
             Commands::ConnectTcp(args) => connect_tcp(args).await,
@@ -359,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
+        info!("{:?}", args);
         info!("NO VALID COMMAND SUPPLIED, operating in socks server forward mode");
         // no command was specified in the arguments, run the server socks command
         let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), ticket_out_path: None, common: CommonArgs {
@@ -366,8 +378,9 @@ async fn main() -> anyhow::Result<()> {
             magic_ipv6_addr: None,
             custom_alpn: None,
             verbose: 0,
+            auto_shutdown: None
         } };
-        listen_tcp(listen_args, true).await.expect("listen failed")
+        listen_tcp(listen_args, true, None).await.expect("listen failed")
     };
     info!("Dumbpipe exiting");
     Ok(())
