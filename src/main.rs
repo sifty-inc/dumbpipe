@@ -63,6 +63,9 @@ pub enum Commands {
     /// The same as listen tcp, but automatically connects to 127.0.0.1:1080
     SocksServerForward(SocksServerForwardArgs),
 
+    // Only do socks proxy
+    SocksOnly(CommonArgs),
+
     /// Connect to a magicsocket, open a bidi stream, and forward stdin/stdout.
     ///
     /// A node ticket is required to connect.
@@ -353,6 +356,10 @@ async fn main() -> anyhow::Result<()> {
                 check_auto_shutdown(&args.common).await;
                 let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: args.common, ticket_out_path: args.ticket_out_path  };
                 listen_tcp(listen_args, true, None).await
+            },
+            Commands::SocksOnly(_args) => {
+                socks_server::spawn_socks_server().await.expect("Failed to start SOCKS5 server");
+                exit(0);
             },
             Commands::Connect(args) => connect_stdio(args).await,
             Commands::ConnectTcp(args) => connect_tcp(args).await,
