@@ -358,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
                 listen_tcp(listen_args, true, None).await
             },
             Commands::SocksOnly(_args) => {
-                socks_server::spawn_socks_server().await.expect("Failed to start SOCKS5 server");
+                socks_server::spawn_socks_server(false).await.expect("Failed to start SOCKS5 server");
                 exit(0);
             },
             Commands::Connect(args) => connect_stdio(args).await,

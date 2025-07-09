@@ -289,7 +289,7 @@ pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Optio
 
     if do_socks {
         tokio::spawn(async {
-            socks_server::spawn_socks_server().await.expect("Failed to start SOCKS5 server");
+            socks_server::spawn_socks_server(true).await.expect("Failed to start SOCKS5 server");
         });
     }
 

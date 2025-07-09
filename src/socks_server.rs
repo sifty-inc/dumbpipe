@@ -9,9 +9,14 @@ use tokio::task;
 use tracing::{error, info, warn};
 
 pub const SOCKS_LISTEN_ADDR: &str = "127.0.0.1:52923";
+pub const ALL_IF_LISTEN_ADDR: &str = "0.0.0.0:52923";
 
-pub async fn spawn_socks_server() -> Result<()> {
-    let listener = TcpListener::bind(SOCKS_LISTEN_ADDR).await?;
+pub async fn spawn_socks_server(loopback: bool) -> Result<()> {
+    let listener = if loopback {
+        TcpListener::bind(SOCKS_LISTEN_ADDR).await?
+    } else {
+        TcpListener::bind(ALL_IF_LISTEN_ADDR).await?
+    };
 
     info!("Listen for socks connections @ {}", SOCKS_LISTEN_ADDR);
 
