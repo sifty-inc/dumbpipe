@@ -12,13 +12,13 @@ pub const SOCKS_LISTEN_ADDR: &str = "127.0.0.1:52923";
 pub const ALL_IF_LISTEN_ADDR: &str = "0.0.0.0:52923";
 
 pub async fn spawn_socks_server(loopback: bool) -> Result<()> {
-    let listener = if loopback {
-        TcpListener::bind(SOCKS_LISTEN_ADDR).await?
+    let listen_addr = if loopback {
+        SOCKS_LISTEN_ADDR
     } else {
-        TcpListener::bind(ALL_IF_LISTEN_ADDR).await?
+        ALL_IF_LISTEN_ADDR
     };
-
-    info!("Listen for socks connections @ {}", SOCKS_LISTEN_ADDR);
+    let listener = TcpListener::bind(listen_addr).await?;
+    info!("Listen for socks connections @ {}", listen_addr);
 
     // Standard TCP loop
     loop {
