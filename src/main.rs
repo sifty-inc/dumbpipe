@@ -351,15 +351,18 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(args) = args {
         let res = match args.command {
             Commands::Listen(args) => listen_stdio(args).await,
-            Commands::ListenTcp(args) => listen_tcp(args, false, None).await,
+            Commands::ListenTcp(args) => {
+                check_auto_shutdown(&args.common).await;
+                listen_tcp(args, false, None).await
+            },
             Commands::SocksServerForward(args) => {
                 check_auto_shutdown(&args.common).await;
                 let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: args.common, ticket_out_path: args.ticket_out_path  };
                 listen_tcp(listen_args, true, None).await
             },
             Commands::SocksOnly(_args) => {
-                socks_server::spawn_socks_server(false).await.expect("Failed to start SOCKS5 server");
-                exit(0);
+                socks_server::spawn_socks_server(false).await?;
+                Ok(())
             },
             Commands::Connect(args) => connect_stdio(args).await,
             Commands::ConnectTcp(args) => connect_tcp(args).await,
