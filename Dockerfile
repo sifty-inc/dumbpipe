@@ -3,6 +3,8 @@ FROM rust:1.83-bookworm AS dumbpipe_builder
 WORKDIR /app
 
 RUN mkdir /app/src/; echo "fn main() {}" > /app/src/main.rs
+RUN mkdir /app/src/; echo "fn main() {}" > /app/src/lib.rs
+RUN mkdir /app/src/; echo "fn main() {}" > /app/uniffi-bindgen.rs
 ADD ./Cargo.toml /app/Cargo.toml
 ADD ./Cargo.lock /app/Cargo.lock
 # can only build dependencies if i build project
