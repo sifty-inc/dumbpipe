@@ -23,8 +23,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl \
+    ca-certificates \
+    iproute2 \
+    iputils-ping \
+    inetutils-traceroute \
+    net-tools \
+    dnsutils \
+    curl \
+    vim \
+    iptables \
+    && rm -rf /var/lib/apt/lists/*
+
+
 ENTRYPOINT ["/bin/bash"]
 COPY start_remote_client.sh /
 COPY start_cloud_portal.sh /
+COPY switch_route_entrypoint.sh /
 
 
