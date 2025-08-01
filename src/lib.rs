@@ -9,12 +9,11 @@ pub const ALPN: &[u8] = b"DUMBPIPEV0";
 /// The side that calls open_bi() first must send this handshake, the side that
 /// calls accept_bi() must consume it.
 pub const HANDSHAKE: [u8; 5] = *b"hello";
-use anyhow::Context;
 use clap::Parser;
-use iroh::endpoint::{Builder, Connecting};
-use iroh::{Endpoint, RelayMap, RelayMode};
+use iroh::endpoint::{Builder};
+use iroh::{RelayMap, RelayMode};
 pub use iroh_base::ticket::NodeTicket;
-use iroh_base::{RelayUrl, SecretKey};
+use iroh::{endpoint::Connecting, Endpoint, NodeAddr, SecretKey, Watcher};
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -24,6 +23,7 @@ use std::process::exit;
 use std::str::FromStr;
 use std::time::Duration;
 use std::{fs, io, thread};
+use data_encoding::HEXLOWER;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::{select, time};
@@ -33,7 +33,7 @@ use toml::de::Error;
 use tracing::log::warn;
 use tracing::{error, info};
 use crate::socks_server::SOCKS_LISTEN_ADDR;
-
+use n0_snafu::{Result, ResultExt};
 mod socks_server;
 
 uniffi::setup_scaffolding!();
@@ -59,14 +59,14 @@ pub struct CommonArgs {
     /// If None, defaults to a random free port, but it can be useful to specify a fixed
     /// port, e.g. to configure a firewall rule.
     #[clap(long, default_value = None)]
-    pub magic_ipv4_addr: Option<SocketAddrV4>,
+    pub ipv4_addr: Option<SocketAddrV4>,
 
     /// The IPv6 address that magicsocket will listen on.
     ///
     /// If None, defaults to a random free port, but it can be useful to specify a fixed
     /// port, e.g. to configure a firewall rule.
     #[clap(long, default_value = None)]
-    pub magic_ipv6_addr: Option<SocketAddrV6>,
+    pub ipv6_addr: Option<SocketAddrV6>,
 
     /// A custom ALPN to use for the magicsocket.
     ///
@@ -93,7 +93,7 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
-    pub fn alpn(&self) -> anyhow::Result<Vec<u8>> {
+    pub fn alpn(&self) -> n0_snafu::Result<Vec<u8>> {
         Ok(match &self.custom_alpn {
             Some(alpn) => parse_alpn(alpn)?,
             None => ALPN.to_vec(),
@@ -115,11 +115,12 @@ pub struct SocksServerForwardArgs {
 }
 
 
-fn parse_alpn(alpn: &str) -> anyhow::Result<Vec<u8>> {
+
+fn parse_alpn(alpn: &str) -> n0_snafu::Result<Vec<u8>> {
     Ok(if let Some(text) = alpn.strip_prefix("utf8:") {
         text.as_bytes().to_vec()
     } else {
-        hex::decode(alpn)?
+        hex::decode(alpn).e()?
     })
 }
 
@@ -160,7 +161,7 @@ pub fn setup_relay_if_specified(mut builder: Builder) -> Builder {
         Ok(url) => {
             match Url::parse(&url) {
                 Ok(url) => {
-                    let relay_url: RelayUrl = url.into();
+                    let relay_url: iroh_base::RelayUrl = url.into();
                     let relay_map: RelayMap = relay_url.into();
                     builder = builder.relay_mode(RelayMode::Custom(relay_map));
                 }
@@ -176,15 +177,23 @@ pub fn setup_relay_if_specified(mut builder: Builder) -> Builder {
 }
 
 
-pub fn get_or_create_secret() -> anyhow::Result<SecretKey> {
+pub fn get_or_create_secret() -> n0_snafu::Result<SecretKey> {
     match std::env::var("IROH_SECRET") {
-        Ok(secret) => SecretKey::from_str(&secret).context("invalid secret"),
+        Ok(secret) => ResultExt::context(SecretKey::from_str(&secret), "invalid secret"),
         Err(_) => {
             let key = SecretKey::generate(rand::rngs::OsRng);
-            info!("using secret key {}", key);
+            info!("using secret key {:?}", key);
             Ok(key)
         }
     }
+}
+
+pub fn print_secret_key(key: &SecretKey) {
+    let bytes = key.to_bytes();
+    let strrep = &HEXLOWER.encode(
+        &bytes
+    );
+    info!("Secret key: {}", strrep);
 }
 
 
@@ -242,7 +251,7 @@ pub async fn forward_bidi(
     to1: impl AsyncWrite + Send + Sync + Unpin + 'static,
     from2: quinn::RecvStream,
     to2: quinn::SendStream,
-) -> anyhow::Result<()> {
+) -> n0_snafu::Result<()> {
     let token1 = CancellationToken::new();
     let token2 = token1.clone();
     let token3 = token1.clone();
@@ -261,8 +270,8 @@ pub async fn forward_bidi(
         token3.cancel();
         io::Result::Ok(())
     });
-    forward_to_stdout.await??;
-    forward_from_stdin.await??;
+    forward_to_stdout.await.e()?.e();
+    forward_from_stdin.await.e()?.e();
     Ok(())
 }
 
@@ -278,8 +287,25 @@ fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
     }
 }
 
+
+pub async fn create_endpoint(
+    secret_key: SecretKey,
+    common: &CommonArgs,
+    alpns: Vec<Vec<u8>>,
+) -> n0_snafu::Result<Endpoint> {
+    let mut builder = Endpoint::builder().secret_key(secret_key).alpns(alpns);
+    if let Some(addr) = common.ipv4_addr {
+        builder = builder.bind_addr_v4(addr);
+    }
+    if let Some(addr) = common.ipv6_addr {
+        builder = builder.bind_addr_v6(addr);
+    }
+    let endpoint = builder.bind().await?;
+    Ok(endpoint)
+}
+
 /// Listen on a magicsocket and forward incoming connections to a tcp socket.
-pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Option<SocksForwardConfig>) -> anyhow::Result<()> {
+pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Option<SocksForwardConfig>) -> n0_snafu::Result<()> {
 
     let file_cfg = if let Some(cfg) = input_config {
         Some(cfg)
@@ -295,38 +321,42 @@ pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Optio
 
     let addrs = match args.host.to_socket_addrs() {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
-        Err(e) => anyhow::bail!("invalid host string {}: {}", args.host, e),
+        Err(e) => snafu::whatever!("invalid host string {}: {}", args.host, e),
     };
     let secret_key: SecretKey = match &file_cfg {
         Some(cfg) => {
             if let Some(sec) = cfg.iroh_secret.as_ref() {
                 info!("Loaded secret key from file");
-                SecretKey::from_str(sec.as_str()).context("invalid secret")?
+                ResultExt::context(SecretKey::from_str(sec.as_str()), "invalid secret")?
             } else {
                 get_or_create_secret()?
             }
         },
         _ => get_or_create_secret()?
     };
-    info!("Listening on {}", secret_key);
+    // info!("Listening on {:?}", se/**/cret_key);
+    print_secret_key(&secret_key);
+
+    let cloned_sec_key = secret_key.clone();
 
     let mut builder = Endpoint::builder()
         .alpns(vec![args.common.alpn()?])
         .secret_key(secret_key);
-    if let Some(addr) = args.common.magic_ipv4_addr {
+    if let Some(addr) = args.common.ipv4_addr {
         builder = builder.bind_addr_v4(addr);
     }
-    if let Some(addr) = args.common.magic_ipv6_addr {
+    if let Some(addr) = args.common.ipv6_addr {
         builder = builder.bind_addr_v6(addr);
     }
     builder = setup_relay_if_specified(builder);
 
-    let endpoint = builder.bind().await?;
+    let endpoint = create_endpoint(cloned_sec_key, &args.common, vec![args.common.alpn()?]).await?;
+
     // wait for the endpoint to figure out its address before making a ticket
-    endpoint.home_relay().initialized().await?;
-    let node_addr = endpoint.node_addr().await?;
-    let mut short = node_addr.clone();
-    let ticket = NodeTicket::new(node_addr);
+    endpoint.home_relay().initialized().await;
+    let node = endpoint.node_addr().initialized().await;
+    let mut short = node.clone();
+    let ticket = NodeTicket::new(node);
     short.direct_addresses.clear();
     let short = NodeTicket::new(short);
 
@@ -346,8 +376,8 @@ pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Optio
     let ticket_s = ticket.to_string();
 
     if let Some(ticket_out) = &args.ticket_out_path {
-        let mut file = File::create(ticket_out).await?;
-        file.write_all(ticket_s.as_bytes()).await?;
+        let mut file = File::create(ticket_out).await.e()?;
+        file.write_all(ticket_s.as_bytes()).await.e()?;
     }
 
     let mothership: Option<String> = match std::env::var("MOTHERSHIP_URL") {
@@ -453,7 +483,7 @@ pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Optio
         connecting: Connecting,
         addrs: Vec<std::net::SocketAddr>,
         handshake: bool,
-    ) -> anyhow::Result<()> {
+    ) -> n0_snafu::Result<()> {
         let connection = connecting.await.context("error accepting connection")?;
         let remote_node_id = &connection.remote_node_id()?;
         tracing::info!("got connection from {}", remote_node_id);
@@ -465,8 +495,8 @@ pub async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Optio
         if handshake {
             // read the handshake and verify it
             let mut buf = [0u8; HANDSHAKE.len()];
-            r.read_exact(&mut buf).await?;
-            anyhow::ensure!(buf == HANDSHAKE, "invalid handshake");
+            r.read_exact(&mut buf).await.e()?;
+            snafu::ensure_whatever!(buf == HANDSHAKE, "invalid handshake");
         }
         let connection = tokio::net::TcpStream::connect(addrs.as_slice())
             .await
@@ -512,8 +542,8 @@ pub fn mobile_start_hook(mothership_url: String, proxy_name: String, iroh_secret
         .init();
     info!("🦀 Dumbpipe starting, version {}", env!("VERGEN_RUSTC_COMMIT_HASH"));
     let cargs = CommonArgs {
-        magic_ipv4_addr: None,
-        magic_ipv6_addr: None,
+        ipv4_addr: None,
+        ipv6_addr: None,
         custom_alpn: None,
         verbose: 0,
         auto_shutdown: None

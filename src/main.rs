@@ -1,9 +1,8 @@
 //! Command line arguments.
 
 use crate::socks_server::SOCKS_LISTEN_ADDR;
-use anyhow::Context;
 use clap::{Parser, Subcommand};
-use dumbpipe::{forward_bidi, get_or_create_secret, listen_tcp, setup_relay_if_specified, CommonArgs, ListenTcpArgs, NodeTicket, SocksServerForwardArgs};
+use dumbpipe::{create_endpoint, forward_bidi, get_or_create_secret, listen_tcp, print_secret_key, setup_relay_if_specified, CommonArgs, ListenTcpArgs, NodeTicket, SocksServerForwardArgs};
 use iroh::endpoint::Builder;
 use iroh::{endpoint::Connecting, Endpoint, NodeAddr, RelayMap, RelayMode, SecretKey};
 use iroh_base::RelayUrl;
@@ -14,6 +13,7 @@ use std::io::Read;
 use std::process::exit;
 use std::time::Duration;
 use std::{fs, io, net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs}, str::FromStr};
+use n0_snafu::ResultExt;
 use tokio::fs::File;
 use tokio::time::sleep;
 use tokio::{io::{AsyncRead, AsyncWrite, AsyncWriteExt}, select, time};
@@ -49,7 +49,7 @@ pub enum Commands {
     /// bidi stream.
     ///
     /// Will print a node ticket on stderr that can be used to connect.
-    Listen(ListenArgs),
+    // Listen(ListenArgs),
 
     /// Listen on a magicsocket and forward incoming connections to the specified
     /// host and port. Every incoming bidi stream is forwarded to a new connection.
@@ -69,7 +69,7 @@ pub enum Commands {
     /// Connect to a magicsocket, open a bidi stream, and forward stdin/stdout.
     ///
     /// A node ticket is required to connect.
-    Connect(ConnectArgs),
+    // Connect(ConnectArgs),
 
     /// Connect to a magicsocket, open a bidi stream, and forward stdin/stdout
     /// to it.
@@ -122,108 +122,8 @@ pub struct ConnectArgs {
 
 
 
-/// Bidirectionally forward data from a quinn stream and an arbitrary tokio
-/// reader/writer pair, aborting both sides when either one forwarder is done,
-/// or when control-c is pressed.
-async fn listen_stdio(args: ListenArgs) -> anyhow::Result<()> {
-    let secret_key = get_or_create_secret()?;
-    let mut builder = Endpoint::builder()
-        .alpns(vec![args.common.alpn()?])
-        .secret_key(secret_key);
-    if let Some(addr) = args.common.magic_ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
-    }
-    if let Some(addr) = args.common.magic_ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
-    }
-    let endpoint = builder.bind().await?;
-    // wait for the endpoint to figure out its address before making a ticket
-    endpoint.home_relay().initialized().await?;
-    let node = endpoint.node_addr().await?;
-    let mut short = node.clone();
-    let ticket = NodeTicket::new(node);
-    short.direct_addresses.clear();
-    let short = NodeTicket::new(short);
-
-    // print the ticket on stderr so it doesn't interfere with the data itself
-    //
-    // note that the tests rely on the ticket being the last thing printed
-    info!("Listening. To connect, use:\ndumbpipe connect {}", ticket);
-    if args.common.verbose > 0 {
-        info!("or:\ndumbpipe connect {}", short);
-    }
-
-    loop {
-        let Some(connecting) = endpoint.accept().await else {
-            break;
-        };
-        let connection = match connecting.await {
-            Ok(connection) => connection,
-            Err(cause) => {
-                tracing::warn!("error accepting connection: {}", cause);
-                // if accept fails, we want to continue accepting connections
-                continue;
-            }
-        };
-        let remote_node_id = &connection.remote_node_id()?;
-        tracing::info!("got connection from {}", remote_node_id);
-        let (s, mut r) = match connection.accept_bi().await {
-            Ok(x) => x,
-            Err(cause) => {
-                tracing::warn!("error accepting stream: {}", cause);
-                // if accept_bi fails, we want to continue accepting connections
-                continue;
-            }
-        };
-        tracing::debug!("accepted bidi stream from {}", remote_node_id);
-        if !args.common.is_custom_alpn() {
-            // read the handshake and verify it
-            let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
-            r.read_exact(&mut buf).await?;
-            anyhow::ensure!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
-        }
-        tracing::info!("forwarding stdin/stdout to {}", remote_node_id);
-        forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
-        // stop accepting connections after the first successful one
-        break;
-    }
-    Ok(())
-}
-
-async fn connect_stdio(args: ConnectArgs) -> anyhow::Result<()> {
-    let secret_key = get_or_create_secret()?;
-    let mut builder = Endpoint::builder().secret_key(secret_key).alpns(vec![]);
-
-    if let Some(addr) = args.common.magic_ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
-    }
-    if let Some(addr) = args.common.magic_ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
-    }
-    let endpoint = builder.bind().await?;
-    let addr = args.ticket.node_addr();
-    let remote_node_id = addr.node_id;
-    // connect to the node, try only once
-    let connection = endpoint.connect(addr.clone(), &args.common.alpn()?).await?;
-    tracing::info!("connected to {}", remote_node_id);
-    // open a bidi stream, try only once
-    let (mut s, r) = connection.open_bi().await?;
-    tracing::info!("opened bidi stream to {}", remote_node_id);
-    // send the handshake unless we are using a custom alpn
-    // when using a custom alpn, evertyhing is up to the user
-    if !args.common.is_custom_alpn() {
-        // the connecting side must write first. we don't know if there will be something
-        // on stdin, so just write a handshake.
-        s.write_all(&dumbpipe::HANDSHAKE).await?;
-    }
-    tracing::info!("forwarding stdin/stdout to {}", remote_node_id);
-    forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
-    tokio::io::stdout().flush().await?;
-    Ok(())
-}
-
 /// Listen on a tcp port and forward incoming connections to a magicsocket.
-async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
+async fn connect_tcp(args: ConnectTcpArgs) -> n0_snafu::Result<()> {
     let addrs = args
         .addr
         .to_socket_addrs()
@@ -233,10 +133,10 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
 
     builder = setup_relay_if_specified(builder);
 
-    if let Some(addr) = args.common.magic_ipv4_addr {
+    if let Some(addr) = args.common.ipv4_addr {
         builder = builder.bind_addr_v4(addr);
     }
-    if let Some(addr) = args.common.magic_ipv6_addr {
+    if let Some(addr) = args.common.ipv6_addr {
         builder = builder.bind_addr_v6(addr);
     }
 
@@ -277,7 +177,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
         endpoint: Endpoint,
         handshake: bool,
         alpn: &[u8],
-    ) -> anyhow::Result<()> {
+    ) -> n0_snafu::Result<()> {
         let (tcp_stream, tcp_addr) = next.context("error accepting tcp connection")?;
         let (tcp_recv, tcp_send) = tcp_stream.into_split();
         tracing::info!("got tcp connection from {}", tcp_addr);
@@ -295,10 +195,10 @@ async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
         if handshake {
             // the connecting side must write first. we don't know if there will be something
             // on stdin, so just write a handshake.
-            magic_send.write_all(&dumbpipe::HANDSHAKE).await?;
+            magic_send.write_all(&dumbpipe::HANDSHAKE).await.e()?;
         }
         forward_bidi(tcp_recv, tcp_send, magic_recv, magic_send).await?;
-        anyhow::Ok(())
+        Ok(())
     }
     let addr = args.ticket.node_addr();
     loop {
@@ -341,7 +241,7 @@ async fn check_auto_shutdown(options: &CommonArgs) {
 
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> n0_snafu::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("dumbpipe=info,dumbpipe::socks_server=info")
         .init();
@@ -350,7 +250,6 @@ async fn main() -> anyhow::Result<()> {
 
     if let Ok(args) = args {
         let res = match args.command {
-            Commands::Listen(args) => listen_stdio(args).await,
             Commands::ListenTcp(args) => {
                 check_auto_shutdown(&args.common).await;
                 listen_tcp(args, false, None).await
@@ -361,14 +260,12 @@ async fn main() -> anyhow::Result<()> {
                 listen_tcp(listen_args, true, None).await
             },
             Commands::SocksOnly(_args) => {
-                socks_server::spawn_socks_server(false).await?;
-                Ok(())
+                socks_server::spawn_socks_server(false).await.e()
             },
-            Commands::Connect(args) => connect_stdio(args).await,
             Commands::ConnectTcp(args) => connect_tcp(args).await,
             Commands::GenSecret(_) => {
                 let key = SecretKey::generate(rand::rngs::OsRng);
-                println!("{}", key);
+                print_secret_key(&key);
                 exit(0)
             }
         };
@@ -384,8 +281,8 @@ async fn main() -> anyhow::Result<()> {
         info!("NO VALID COMMAND SUPPLIED, operating in socks server forward mode");
         // no command was specified in the arguments, run the server socks command
         let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), ticket_out_path: None, common: CommonArgs {
-            magic_ipv4_addr: None,
-            magic_ipv6_addr: None,
+            ipv4_addr: None,
+            ipv6_addr: None,
             custom_alpn: None,
             verbose: 0,
             auto_shutdown: None
