@@ -1,16 +1,20 @@
 networks:
   lte100:
-    driver: macvlan
+    driver: ipvlan
     driver_opts:
       parent: enp170s0
+      ipvlan_mode: l2
+      com.docker.network.driver.mtu: "1420"
     ipam:
       config:
         - subnet: 192.168.100.0/24
           gateway: 192.168.100.1
   lte101:
-    driver: macvlan
+    driver: ipvlan
     driver_opts:
       parent: enp170s0
+      ipvlan_mode: l2
+      com.docker.network.driver.mtu: "1420"
     ipam:
       config:
         - subnet: 192.168.101.0/24
@@ -46,10 +50,13 @@ services:
     entrypoint: /switch_route_entrypoint.sh
     command: ['/dumbpipe', 'socks-only']
     restart: 'always'
+    dns: [1.1.1.1, 8.8.8.8]
     networks:
       lte100:
         ipv4_address: 192.168.100.10
       default:
+    sysctls:
+      net.ipv4.tcp_mtu_probing: "1"
     cap_add:
       - NET_ADMIN
     privileged: true
@@ -59,10 +66,13 @@ services:
     entrypoint: /switch_route_entrypoint.sh
     command: ['/dumbpipe', 'socks-only']
     restart: 'always'
+    dns: [1.1.1.1, 8.8.8.8]
     networks:
       lte101:
         ipv4_address: 192.168.101.10
       default:
     cap_add:
       - NET_ADMIN
+    sysctls:
+      net.ipv4.tcp_mtu_probing: "1"
     privileged: true
