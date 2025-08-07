@@ -2,77 +2,86 @@ networks:
   lte100:
     driver: ipvlan
     driver_opts:
-      parent: enp170s0
+      parent: ipv100
       ipvlan_mode: l2
-      com.docker.network.driver.mtu: "1420"
+      com.docker.network.driver.mtu: "1428"
     ipam:
       config:
         - subnet: 192.168.100.0/24
           gateway: 192.168.100.1
-  lte101:
-    driver: ipvlan
-    driver_opts:
-      parent: enp170s0
-      ipvlan_mode: l2
-      com.docker.network.driver.mtu: "1420"
-    ipam:
-      config:
-        - subnet: 192.168.101.0/24
-          gateway: 192.168.101.1
+#  lte101:
+#    driver: ipvlan
+#    driver_opts:
+#      parent: ipv101
+#      ipvlan_mode: l2
+#      com.docker.network.driver.mtu: "1420"
+#    ipam:
+#      config:
+#        - subnet: 192.168.101.0/24
+#          gateway: 192.168.101.1
+  backstage:
+    internal: true
   default:
     driver: bridge
 
 services:
   dp100:
-    image: dumbpipe
+    image: dumbpipe_proxy:latest
     container_name: dp100
     entrypoint: ['/dumbpipe']
     command: ['listen-tcp', '--host', 'lte100:52923', '--auto-shutdown', '43200']
     restart: 'always'
+    networks: 
+      - default
+      - backstage
     depends_on:
       - lte100
     volumes:
       - ./configs/dp100.toml:/config.toml
-  dp101:
-    image: dumbpipe
-    container_name: dp101
-    entrypoint: ['/dumbpipe']
-    command: ['listen-tcp', '--host', 'lte101:52923', '--auto-shutdown', '43200']
-    restart: 'always'
-    depends_on:
-      - lte101
-    volumes:
-      - ./configs/dp101.toml:/config.toml
-
   lte100:
-    image: dumbpipe
+    image: dumbpipe_proxy:latest
     container_name: lte100
     entrypoint: /switch_route_entrypoint.sh
     command: ['/dumbpipe', 'socks-only']
     restart: 'always'
-    dns: [1.1.1.1, 8.8.8.8]
     networks:
       lte100:
         ipv4_address: 192.168.100.10
-      default:
-    sysctls:
+      backstage:
+    sysctls:                           #  <<— add this block
       net.ipv4.tcp_mtu_probing: "1"
+      net.ipv4.tcp_congestion_control: bbr
     cap_add:
       - NET_ADMIN
+  
     privileged: true
-  lte101:
-    image: dumbpipe
-    container_name: lte101
-    entrypoint: /switch_route_entrypoint.sh
-    command: ['/dumbpipe', 'socks-only']
-    restart: 'always'
-    dns: [1.1.1.1, 8.8.8.8]
-    networks:
-      lte101:
-        ipv4_address: 192.168.101.10
-      default:
-    cap_add:
-      - NET_ADMIN
-    sysctls:
-      net.ipv4.tcp_mtu_probing: "1"
-    privileged: true
+
+#  dp101:
+#    image: dumbpipe_proxy:latest
+#    container_name: dp101
+#    entrypoint: ['/dumbpipe']
+#    command: ['listen-tcp', '--host', 'lte101:52923', '--auto-shutdown', '43200']
+#    restart: 'always'
+#    networks: 
+#      - default
+#      - backstage
+#    depends_on:
+#      - lte101
+#    volumes:
+#      - ./configs/dp101.toml:/config.toml
+#
+#  lte101:
+#    image: dumbpipe_proxy:latest
+#    container_name: lte101
+#    entrypoint: /switch_route_entrypoint.sh
+#    command: ['/dumbpipe', 'socks-only']
+#    restart: 'always'
+#    networks:
+#      lte101:
+#        ipv4_address: 192.168.101.10
+#      backstage:
+#    cap_add:
+#      - NET_ADMIN
+#    sysctls:
+#      net.ipv4.tcp_mtu_probing: "1"
+#    privileged: true

@@ -11,7 +11,11 @@ ADD ./Cargo.lock /app/Cargo.lock
 RUN cargo build --release
 RUN rm -rf /app/src
 
-ADD ./ /app/
+ADD ./src /app/src
+ADD ./uniffi_build.sh /app/
+ADD ./build.rs /app/
+ADD ./Cargo.toml /app/
+ADD ./Cargo.lock /app/
 RUN cargo build --release
 RUN ls -lstarh target/release
 
