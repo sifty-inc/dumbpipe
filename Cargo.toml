@@ -25,6 +25,12 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 data-encoding = "2.9.0"
 n0-error = "0.1"
+fast-socks5 = "1.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2+spec-1.1.0"
+reqwest = { version = "0.13.2", features = ["form"] }
+time = "0.3.47"
+serde_json = "1.0.149"
 
 [dev-dependencies]
 duct = "1.1.1"

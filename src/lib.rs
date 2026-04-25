@@ -1,3 +1,5 @@
+mod socks_server;
+
 /// The ALPN for dumbpipe.
 ///
 /// It is basically just passing data through 1:1, except that the connecting

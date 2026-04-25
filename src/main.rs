@@ -1,18 +1,17 @@
 //! Command line arguments.
-use std::{
-    io,
-    net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
-    str::FromStr,
-    time::Duration,
-};
-
+use std::{fs, io, net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs}, str::FromStr, time::Duration};
+use std::io::Read;
+use std::process::exit;
 use clap::{Parser, Subcommand};
+use data_encoding::HEXLOWER;
 use dumbpipe::EndpointTicket;
 use iroh::{
-    endpoint::{presets, Accepting},
-    Endpoint, EndpointAddr, SecretKey,
+    endpoint::{presets, Accepting, TransportAddrUsage},
+    Endpoint, EndpointAddr, SecretKey, TransportAddr,
 };
+use std::sync::{Arc, Mutex};
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
+use reqwest::StatusCode;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     select,
@@ -24,6 +23,45 @@ use {
     std::path::PathBuf,
     tokio::net::{UnixListener, UnixStream},
 };
+use serde::Deserialize;
+use tokio::time::sleep;
+use serde_json::{Map, Value};
+use crate::socks_server::SOCKS_LISTEN_ADDR;
+
+mod socks_server;
+
+
+#[derive(Deserialize)]
+pub struct SocksForwardConfig {
+    mothership_url: Option<String>,
+    proxy_name: Option<String>,
+    iroh_secret: Option<String>
+}
+fn read_file_if_exists(path: &str) -> Option<String> {
+    if let Ok(mut file) = fs::File::open(path) {
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_ok() {
+            Some(contents)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+
+
+fn try_load_config_from_file() -> Option<SocksForwardConfig> {
+    let filedata = read_file_if_exists("./config.toml");
+    if let Some(filedata) = filedata {
+        let cfg: Result<SocksForwardConfig, toml::de::Error> = toml::from_str(&filedata);
+        cfg.ok()
+    } else {
+        None
+    }
+}
+
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -104,6 +142,12 @@ pub enum Commands {
     /// As far as the endpoint is concerned, this is connecting. But it is
     /// listening on a Unix socket for which you have to specify the path.
     ConnectUnix(ConnectUnixArgs),
+
+    // Only do socks proxy
+    SocksOnly(CommonArgs),
+    GenSecret(CommonArgs),
+    /// The same as listen tcp, but automatically connects socksproxy
+    SocksServerForward(SocksServerForwardArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -135,6 +179,9 @@ pub struct CommonArgs {
     /// Otherwise, it will be parsed as a hex string.
     #[clap(long)]
     pub custom_alpn: Option<String>,
+
+    #[clap(long)]
+    pub auto_shutdown: Option<u32>,
 
     /// The verbosity level. Repeat to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
@@ -179,6 +226,9 @@ pub struct ListenTcpArgs {
 
     #[clap(flatten)]
     pub common: CommonArgs,
+
+    #[clap(long)]
+    pub ticket_out_path: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -207,6 +257,15 @@ pub struct ConnectArgs {
 
     #[clap(flatten)]
     pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct SocksServerForwardArgs {
+    #[clap(flatten)]
+    pub common: CommonArgs,
+
+    #[clap(long)]
+    pub ticket_out_path: Option<String>,
 }
 
 #[cfg(unix)]
@@ -539,12 +598,40 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
 }
 
 /// Listen on an endpoint and forward incoming connections to a tcp socket.
-async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
+async fn listen_tcp(args: ListenTcpArgs, do_socks: bool, input_config: Option<SocksForwardConfig>) -> Result<()> {
+
+
+    let file_cfg = if let Some(cfg) = input_config {
+        Some(cfg)
+    } else {
+        try_load_config_from_file()
+    };
+
+    if do_socks {
+        tokio::spawn(async {
+            socks_server::spawn_socks_server(true).await.expect("Failed to start SOCKS5 server");
+        });
+    }
+
+
     let addrs = match args.host.to_socket_addrs() {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
         Err(e) => bail_any!("invalid host string {}: {}", args.host, e),
     };
-    let secret_key = get_or_create_secret()?;
+    let secret_key: SecretKey = match &file_cfg {
+        Some(cfg) => {
+            if let Some(sec) = cfg.iroh_secret.as_ref() {
+                tracing::info!("Loaded secret key from file");
+                SecretKey::from_str(sec.as_str())?
+            } else {
+                get_or_create_secret()?
+            }
+        },
+        _ => get_or_create_secret()?
+    };
+
+    print_secret_key(&secret_key);
+
     let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
     // wait for the endpoint to figure out its address before making a ticket
     if (timeout(ONLINE_TIMEOUT, endpoint.online()).await).is_err() {
@@ -573,32 +660,47 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
             .map_or("None".to_string(), |url| url.to_string())
     );
 
+    let seen_connections: Arc<Mutex<std::collections::HashMap<String, String>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    setup_proxy_and_mothership(file_cfg, endpoint.clone(), short.to_string(), Arc::clone(&seen_connections)).await?;
+
     // handle a new incoming connection on the endpoint
     async fn handle_endpoint_accept(
         accepting: Accepting,
         addrs: Vec<std::net::SocketAddr>,
         handshake: bool,
+        endpoint: Endpoint,
+        seen: Arc<Mutex<std::collections::HashMap<String, String>>>,
     ) -> Result<()> {
-        let connection = accepting.await.std_context("error accepting connection")?;
-        let remote_endpoint_id = &connection.remote_id();
+        let iroh_conn = accepting.await.std_context("error accepting connection")?;
+        let remote_endpoint_id = iroh_conn.remote_id();
         tracing::info!("got connection from {}", remote_endpoint_id);
-        let (s, mut r) = connection
+        let (s, mut r) = iroh_conn
             .accept_bi()
             .await
             .std_context("error accepting stream")?;
         tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
+        let conn_type = if let Some(info) = endpoint.remote_info(remote_endpoint_id).await {
+            let is_direct = info.addrs().any(|a| {
+                matches!(a.addr(), TransportAddr::Ip(_))
+                    && matches!(a.usage(), TransportAddrUsage::Active)
+            });
+            if is_direct { "direct" } else { "relay" }
+        } else {
+            "relay"
+        };
+        seen.lock().unwrap().insert(remote_endpoint_id.to_string(), conn_type.to_string());
         if handshake {
             // read the handshake and verify it
             let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
             r.read_exact(&mut buf).await.anyerr()?;
             ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
         }
-        let connection = tokio::net::TcpStream::connect(addrs.as_slice())
+        let tcp_conn = tokio::net::TcpStream::connect(addrs.as_slice())
             .await
             .std_context(format!("error connecting to {addrs:?}"))?;
-        let (read, write) = connection.into_split();
-        forward_bidi(read, write, r, s).await?;
-        Ok(())
+        let (read, write) = tcp_conn.into_split();
+        forward_bidi(read, write, r, s).await
     }
 
     loop {
@@ -617,8 +719,10 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
         };
         let addrs = addrs.clone();
         let handshake = !args.common.is_custom_alpn();
+        let seen = Arc::clone(&seen_connections);
+        let ep = endpoint.clone();
         tokio::spawn(async move {
-            if let Err(cause) = handle_endpoint_accept(connecting, addrs, handshake).await {
+            if let Err(cause) = handle_endpoint_accept(connecting, addrs, handshake, ep, seen).await {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
@@ -626,6 +730,103 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
             }
         });
     }
+    Ok(())
+}
+
+async fn setup_proxy_and_mothership(file_cfg: Option<SocksForwardConfig>, _endpoint: Endpoint, ticket: String, seen_connections: Arc<Mutex<std::collections::HashMap<String, String>>>) -> Result<()> {
+
+    let mothership: Option<String> = match std::env::var("MOTHERSHIP_URL") {
+        Ok(url) => Some(url),
+        Err(_) =>  {
+            match &file_cfg {
+                None => None,
+                Some(ref c) => {
+                    c.mothership_url.clone()
+                }
+            }
+        }
+    };
+
+
+    let proxy_name: Option<String> = match std::env::var("PROXY_NAME") {
+        Ok(url) => Some(url),
+        Err(_) =>  {
+            match &file_cfg {
+                None => None,
+                Some(ref c) => {
+                    c.proxy_name.clone()
+                }
+            }
+        }
+    };
+
+
+    if let Some(mothership) = mothership {
+        let checkin_internval = match std::env::var("MOTHERSHIP_UPDATE_INTERVAL_SECS") {
+            Ok(val) => u64::from_str_radix(&val, 10).expect("Invalid mothership update interval"),
+            Err(_) => 5
+        };
+        let name = match proxy_name {
+            Some(name) => name,
+            None => {
+                tracing::error!("PROXY_NAME is required with mothership");
+                exit(1)
+            }
+        };
+        tracing::info!("Proxy name: {name}");
+        tracing::info!("Will check in with mothership at {}, interval: {}", &mothership, checkin_internval);
+        let conns_clone = Arc::clone(&seen_connections);
+        tokio::spawn( async move {
+            let client = reqwest::Client::new();
+            loop {
+                let snapshot: std::collections::HashMap<String, String> = conns_clone.lock().unwrap().clone();
+                let mut map = Map::new();
+                for (id, conn_type) in &snapshot {
+                    map.insert(id.clone(), Value::String(conn_type.clone()));
+                }
+                let obj = Value::Object(map);
+
+                let params = [("name", name.as_str()), ("ticket", &ticket), ("connections", &obj.to_string())];
+                tracing::info!("connection data: {}", &obj.to_string());
+
+                let res = client.post(&mothership)
+                    .form(&params)
+                    .send()
+                    .await;
+
+                match res {
+                    Ok(res) => {
+                        match res.status() {
+                            StatusCode::OK => {
+                                tracing::info!("Checked in with mothership");
+                                conns_clone.lock().unwrap().retain(|k, _| !snapshot.contains_key(k));
+                                let x = res.text().await;
+                                if let Ok(x) = x {
+                                    tracing::info!("result is {x}")
+                                }
+
+                            },
+                            StatusCode::GONE => {
+                                tracing::error!("Mothership sent status 410: Gone, shutting down");
+                                exit(1)
+                            },
+                            status_code => {
+                                let res = res.text().await.unwrap_or(String::from("unknown"));
+                                tracing::error!("Check in failed, will retry. Got status code {status_code}: {res}");
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("Could not connect to mothership {:?}", e)
+                    }
+                }
+
+                sleep(Duration::from_secs(checkin_internval)).await;
+            }
+        });
+    } else {
+        tracing::warn!("No mothership supplied");
+    };
     Ok(())
 }
 
@@ -867,28 +1068,86 @@ async fn generate_ticket() -> Result<()> {
     Ok(())
 }
 
+
+async fn check_auto_shutdown(options: &CommonArgs) {
+    if let Some(secs) = options.auto_shutdown {
+        tracing::info!("Will automatically shutdown in {} seconds", secs);
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(secs as u64)).await;
+            tracing::info!("Auto shutdown happening NOW");
+            exit(0);
+        });
+    }
+}
+
+pub fn print_secret_key(key: &SecretKey) {
+    let bytes = key.to_bytes();
+    let strrep = &HEXLOWER.encode(
+        &bytes
+    );
+    tracing::info!("Secret key: {}", strrep);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-    let res = match args.command {
-        Commands::GenerateTicket => generate_ticket().await,
-        Commands::Listen(args) => listen_stdio(args).await,
-        Commands::ListenTcp(args) => listen_tcp(args).await,
-        Commands::Connect(args) => connect_stdio(args).await,
-        Commands::ConnectTcp(args) => connect_tcp(args).await,
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
+    let args = Args::try_parse();
+    if let Ok(args) = args {
+        let res = match args.command {
+            Commands::GenerateTicket => generate_ticket().await,
+            Commands::Listen(args) => listen_stdio(args).await,
+            Commands::ListenTcp(args) => {
+                check_auto_shutdown(&args.common).await;
+                listen_tcp(args, false, None).await
+            },
+            Commands::SocksServerForward(args) => {
+                check_auto_shutdown(&args.common).await;
+                let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), common: args.common, ticket_out_path: args.ticket_out_path };
+                listen_tcp(listen_args, true, None).await
+            },
+            Commands::Connect(args) => connect_stdio(args).await,
+            Commands::ConnectTcp(args) => connect_tcp(args).await,
 
-        #[cfg(unix)]
-        Commands::ListenUnix(args) => listen_unix(args).await,
+            #[cfg(unix)]
+            Commands::ListenUnix(args) => listen_unix(args).await,
 
-        #[cfg(unix)]
-        Commands::ConnectUnix(args) => connect_unix(args).await,
-    };
-    match res {
-        Ok(()) => std::process::exit(0),
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1)
+            #[cfg(unix)]
+            Commands::ConnectUnix(args) => connect_unix(args).await,
+
+            Commands::SocksOnly(_args) => Ok({
+                socks_server::spawn_socks_server(false).await.anyerr()?
+            }),
+            Commands::GenSecret(_) => {
+                let key = SecretKey::generate();
+                print_secret_key(&key);
+                exit(0)
+            }
+        };
+        match res {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1)
+            }
         }
-    }
+    } else {
+        // no default command
+        tracing::info!("No command supplied, operating in socks server forward mode");
+        // no command was specified in the arguments, run the server socks command
+        let listen_args = ListenTcpArgs { host: String::from(SOCKS_LISTEN_ADDR), ticket_out_path: None, common: CommonArgs {
+            ipv4_addr: None,
+            ipv6_addr: None,
+            custom_alpn: None,
+            verbose: 0,
+            auto_shutdown: None
+        } };
+        listen_tcp(listen_args, true, None).await.expect("listen failed")
+    };
+    tracing::info!("Dumbpipe exiting");
+    Ok(())
 }
