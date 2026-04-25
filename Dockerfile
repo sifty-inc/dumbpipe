@@ -2,7 +2,7 @@ FROM rust:1.95-trixie AS dumbpipe_builder
 
 WORKDIR /app
 
-RUN mkdir /app/src/; echo "fn main() {}" > /app/src/main.rs; echo "fn main() {}" > /app/src/lib.rs; echo "fn main() {}" > /app/uniffi-bindgen.rs
+RUN mkdir /app/src/; echo "fn main() {}" > /app/src/main.rs; echo "fn main() {}" > /app/src/lib.rs;
 
 ADD ./Cargo.toml /app/Cargo.toml
 ADD ./Cargo.lock /app/Cargo.lock
@@ -12,8 +12,7 @@ RUN cargo build --release
 RUN rm -rf /app/src
 
 ADD ./src /app/src
-ADD ./uniffi_build.sh /app/
-ADD ./build.rs /app/
+RUN find /app/src -name "*.rs" -exec touch {} +
 ADD ./Cargo.toml /app/
 ADD ./Cargo.lock /app/
 RUN cargo build --release
