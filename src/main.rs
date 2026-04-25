@@ -764,7 +764,7 @@ async fn setup_proxy_and_mothership(file_cfg: Option<SocksForwardConfig>, _endpo
     if let Some(mothership) = mothership {
         let checkin_internval = match std::env::var("MOTHERSHIP_UPDATE_INTERVAL_SECS") {
             Ok(val) => u64::from_str_radix(&val, 10).expect("Invalid mothership update interval"),
-            Err(_) => 5
+            Err(_) => 60
         };
         let name = match proxy_name {
             Some(name) => name,
