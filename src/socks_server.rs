@@ -1,6 +1,7 @@
 use fast_socks5::server::{run_tcp_proxy, DnsResolveHelper, Socks5ServerProtocol};
 use fast_socks5::{ReplyError, Socks5Command, SocksError};
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr::{V4, V6};
 use std::time::Duration;
 use fast_socks5::util::target_addr::TargetAddr;
@@ -29,20 +30,39 @@ pub async fn spawn_socks_server(loopback: bool) -> Result<(), SocksError> {
             }
             Err(err) => {
                 warn!("accept error = {:?}", err);
+                // Errors like EMFILE/ENFILE persist until a descriptor is freed, and
+                // retrying immediately would spin the accept loop at full tilt. Back
+                // off briefly so the runtime can make progress closing connections.
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
 
 }
 
+/// Timeout for connecting out to the target of a `CONNECT` command.
 const TIMEOUT: u64 = 30;
+/// Timeout for a client to complete the socks5 greeting and command.
+///
+/// Without this a client that connects and then says nothing parks a descriptor
+/// forever, since the negotiation below has no deadline of its own.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 async fn serve_socks5(socket: tokio::net::TcpStream) -> Result<(), SocksError> {
-    let (proto, cmd, target_addr) =
+    let negotiate = async {
         Socks5ServerProtocol::accept_no_auth(socket).await?
             .read_command()
             .await?
             .resolve_dns()
-            .await?;
+            .await
+    };
+    let (proto, cmd, target_addr) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiate).await {
+        Ok(res) => res?,
+        Err(_) => {
+            warn!("socks5 handshake timed out");
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "socks5 handshake timed out").into());
+        }
+    };
 
     match cmd {
         Socks5Command::TCPConnect => {

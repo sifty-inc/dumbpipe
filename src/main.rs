@@ -9,7 +9,7 @@ use iroh::{
     endpoint::{presets, Accepting, TransportAddrUsage},
     Endpoint, EndpointAddr, SecretKey, TransportAddr,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
 use reqwest::StatusCode;
 use tokio::{
@@ -319,6 +319,22 @@ async fn copy_to_noq(
     }
 }
 
+/// Copy until EOF, then shut the writer down.
+///
+/// `tokio::io::copy` flushes the writer but never shuts it down, so on its own it
+/// does not turn the reader's EOF into a FIN on the destination socket. The peer
+/// would then wait for data that is never coming, neither side would ever close,
+/// and both descriptors would stay pinned for the lifetime of the process.
+async fn copy_and_shutdown(
+    from: &mut (impl AsyncRead + Unpin),
+    to: &mut (impl AsyncWrite + Unpin),
+) -> io::Result<u64> {
+    let size = tokio::io::copy(from, to).await?;
+    // best effort: the peer may already be gone, which is not an error here
+    to.shutdown().await.ok();
+    Ok(size)
+}
+
 /// Copy from a noq stream to a writer.
 ///
 /// Will send stop to the other side if the operation is cancelled, and fail
@@ -331,9 +347,7 @@ async fn copy_from_noq(
     token: CancellationToken,
 ) -> io::Result<u64> {
     tokio::select! {
-        res = tokio::io::copy(&mut recv, &mut to) => {
-            Ok(res?)
-        },
+        res = copy_and_shutdown(&mut recv, &mut to) => res,
         _ = token.cancelled() => {
             recv.stop(0u8.into()).ok();
             Err(io::Error::other("cancelled"))
@@ -377,39 +391,57 @@ async fn create_endpoint(
     Ok(endpoint)
 }
 
-fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
-    move |x| {
-        token.cancel();
-        x
-    }
+/// A process-wide token that is cancelled when control-c is pressed.
+///
+/// Spawning a `ctrl_c()` watcher per forwarded connection leaks a task and a
+/// signal registration for every connection the process ever handles, so a
+/// single watcher is installed and hands out child tokens instead. Child tokens
+/// are unregistered when they are dropped, so they do not accumulate.
+fn shutdown_token() -> &'static CancellationToken {
+    static SHUTDOWN: OnceLock<CancellationToken> = OnceLock::new();
+    SHUTDOWN.get_or_init(|| {
+        let token = CancellationToken::new();
+        let watcher = token.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                watcher.cancel();
+            }
+        });
+        token
+    })
 }
 
 /// Bidirectionally forward data from a noq stream and an arbitrary tokio
-/// reader/writer pair, aborting both sides when either one forwarder is done,
-/// or when control-c is pressed.
+/// reader/writer pair.
+///
+/// A direction that ends cleanly propagates the half-close to its peer and lets
+/// the other direction keep running, so long downloads survive a client that is
+/// done sending. A direction that fails - or panics - cancels its sibling, so a
+/// broken connection never leaves the other half parked on a descriptor.
 async fn forward_bidi(
     from1: impl AsyncRead + Send + Sync + Unpin + 'static,
     to1: impl AsyncWrite + Send + Sync + Unpin + 'static,
     from2: noq::RecvStream,
     to2: noq::SendStream,
 ) -> Result<()> {
-    let token1 = CancellationToken::new();
+    let token1 = shutdown_token().child_token();
     let token2 = token1.clone();
-    let token3 = token1.clone();
     let forward_from_stdin = tokio::spawn(async move {
-        copy_to_noq(from1, to2, token1.clone())
-            .await
-            .map_err(cancel_token(token1))
+        let guard = token1.clone().drop_guard();
+        let res = copy_to_noq(from1, to2, token1).await;
+        if res.is_ok() {
+            // clean EOF: let the other direction drain
+            guard.disarm();
+        }
+        res
     });
     let forward_to_stdout = tokio::spawn(async move {
-        copy_from_noq(from2, to1, token2.clone())
-            .await
-            .map_err(cancel_token(token2))
-    });
-    let _control_c = tokio::spawn(async move {
-        tokio::signal::ctrl_c().await?;
-        token3.cancel();
-        io::Result::Ok(())
+        let guard = token2.clone().drop_guard();
+        let res = copy_from_noq(from2, to1, token2).await;
+        if res.is_ok() {
+            guard.disarm();
+        }
+        res
     });
     forward_to_stdout.await.anyerr()?.anyerr()?;
     forward_from_stdin.await.anyerr()?.anyerr()?;
@@ -1086,6 +1118,48 @@ pub fn print_secret_key(key: &SecretKey) {
         &bytes
     );
     tracing::info!("Secret key: {}", strrep);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Regression test for the descriptor leak: a forwarding direction that ends
+    /// must leave the destination socket readable-to-EOF by its peer.
+    ///
+    /// Without the shutdown in `copy_and_shutdown` the peer's `read_to_end` never
+    /// returns, the connection stays half-open forever, and its descriptor is
+    /// pinned for the lifetime of the process.
+    #[tokio::test]
+    async fn copy_and_shutdown_closes_write_side() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            // only returns once the other end has actually shut its write side down
+            sock.read_to_end(&mut got).await.unwrap();
+            got
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let (_read, mut write) = sock.into_split();
+        let mut src = &b"hello"[..];
+        let n = copy_and_shutdown(&mut src, &mut write).await.unwrap();
+        assert_eq!(n, 5);
+
+        // hold the write half open past the copy, so passing can only be the
+        // explicit shutdown and never `OwnedWriteHalf`'s shutdown-on-drop
+        let got = timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("peer never saw EOF: write side was not shut down")
+            .unwrap();
+        assert_eq!(got, b"hello");
+        drop(write);
+    }
 }
 
 #[tokio::main]
