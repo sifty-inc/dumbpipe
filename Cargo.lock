@@ -796,6 +796,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-tickets",
+ "libc",
  "n0-error",
  "nix",
  "noq",
